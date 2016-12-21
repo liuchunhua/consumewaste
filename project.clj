@@ -4,11 +4,13 @@
   :license {:name "Eclipse Public License"
             :url "http://www.eclipse.org/legal/epl-v10.html"}
   :dependencies [[org.clojure/clojure "1.8.0"]
+                 [org.clojure/core.async "0.2.395"]
                  [incanter/incanter-core "1.5.7"]
                  [incanter/incanter-io "1.5.7"]
                  [org.clojure/java.jdbc "0.7.0-alpha1"]
                  [com.oracle/ojdbc6 "12.1.0.2.0"]
                  [com.mchange/c3p0 "0.9.2.1"]
+                 [com.taoensso/carmine "2.15.0"]
                  ]
   :profiles {:dev {:plugins [[cider/cider-nrepl "0.14.0-SNAPSHOT"]]}}
   :local-repo "D:\\m2")
