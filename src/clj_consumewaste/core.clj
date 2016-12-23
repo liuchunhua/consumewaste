@@ -5,7 +5,16 @@
   (:require [clojure.core.reducers :as r]
             [clojure.java.io :as io]
             [taoensso.carmine :as car :refer (wcar)])
-  (:import com.mchange.v2.c3p0.ComboPooledDataSource))
+  (:import com.mchange.v2.c3p0.ComboPooledDataSource
+           (org.apache.lucene.analysis.cn.smart SmartChineseAnalyzer)
+           (org.apache.lucene.analysis CharArraySet)
+           (org.apache.lucene.store FSDirectory RAMDirectory)
+           (org.apache.lucene.util Version)
+           (org.apache.lucene.index IndexWriterConfig IndexWriter IndexReader DirectoryReader)
+           (org.apache.lucene.search IndexSearcher Query ScoreDoc TopDocs Sort SortField SortField$Type)
+           (org.apache.lucene.queryparser.classic QueryParser)
+           (org.apache.lucene.document Document Field TextField StringField Field$Store)
+           (java.nio.file Paths)))
 
 (def db {:classname "oracle.jdbc.OracleDriver"
          :subprotocol "oracle"
@@ -33,23 +42,49 @@
 (def server1-conn {:pool {} :spec {:host "10.180.29.70" :port 6379}}) ; See `wcar` docstring for opts
 (defmacro wcar* [& body] `(car/wcar server1-conn ~@body))
 
+(defn round
+  [n m]
+  (let [factor (Math/pow 10.0 m)]
+    (/ (Math/round (* n factor)) factor)))
+
+(defn bd09-gcj02
+  "百度坐标转高德坐标"
+  [^floats [lng lat]]
+  (let [PI 3.14159265358979324
+        radians (/ (* PI 3000.0) 180)
+        x (- lng 0.0065)
+        y (- lat 0.006)
+        z (- (Math/sqrt (+ (* x x) (* y y))) (* 0.00002 (Math/sin (* y radians))))
+        theta  (- (Math/atan2 y x) (* 0.000003 (Math/cos (* x radians))))]
+    [(round (* z (Math/cos theta)) 6)
+     (round (* z (Math/sin theta)) 6)]))
+
+(defn gcj02-bd09
+  "高德转百度"
+  [^floats [lng, lat]]
+  (let [radians (/ (* Math/PI 3000.0) 180)
+        z (+ (Math/sqrt (+ (* lng lng) (* lat lat))) (* 0.00002 (Math/sin (* lat radians))))
+        theta (+ (Math/atan2 lat lng) (* 0.000003 (Math/cos (* lng radians))))]
+    [(round (+ (* z (Math/cos theta)) 0.0065) 6)
+     (round (+ (* z (Math/sin theta)) 0.006) 6)]))
+
 (defn carno_extrace
   "获取消费记录中所有的卡号"
-  []
-  (query (db-conn) ["SELECT DISTINCT CARDNO FROM DA_ETC_CONSUME_PARSE where savetime > date'2016-07-01' and savetime < date'2016-08-01' and rownum < 200"] {:row-fn :cardno :result-set-fn vec}))
+  [start end]
+  (query (db-conn) ["SELECT DISTINCT CARDNO FROM DA_ETC_CONSUME_PARSE where savetime > to_date(?,'YYYY-MM-DD') and savetime < to_date(?,'YYYY-MM-DD')" start end] {:row-fn :cardno :result-set-fn vec}))
 
 (defn car_driver_record
   "获得车辆的行驶记录"
-  [carno_coll]
+  [start end carno_coll]
   (let [params (join " ," (repeat (count carno_coll) "?"))
         sql (join ["select distinct CARDNO, INSTATION, INTIME, OUTSTATION, OUTTIME from DA_ETC_CONSUME_PARSE where cardno in ("
                    params
-                   ") and savetime > date'2016-07-01' and savetime < date'2016-08-01' "
+                   ") and savetime > to_date(?,'YYYY-MM-DD') and savetime < to_date(?,'YYYY-MM-DD')"
                    "and intime is not null and outtime is not null"
                    " order by INTIME"])]
     (do
       (try
-        (->> (query (db-conn) (concat [sql] carno_coll))
+        (->> (query (db-conn) (concat [sql] carno_coll, [start end]))
              (group-by :cardno)
              (vals))
         (catch Exception e (prn (.getNextException e)))
@@ -77,14 +112,14 @@
   "计算省界收费站,
   record 车辆行驶记录
   seconds 过省界的时间上线"
-  [record seconds]
+  [seconds record]
   (let [rest (rest_time record)
         is_province (map-indexed (fn [idx itm] [idx (and (> itm 0) (< itm seconds))]) rest);;停留时间小于预定时间则是省界收费站
         num (count rest)]
     (->> is_province
          (filter (fn [[idx itm]] itm))
          (map (fn [[idx _]] [(-> record (get idx) :outstation) (-> record (get (inc idx)) :instation)])) ;'([instation, outstation],...)
-         )))
+)))
 
 (defn print_province_station
   [record seconds]
@@ -113,19 +148,19 @@
   ([& m] (apply merge-with + m)))
 
 (defn parse_all_shengjie_sfz
-  []
-  (->> (carno_extrace)
+  [seconds start end]
+  (->> (carno_extrace start end)
        (partition-all 10)
        vec
-       (r/mapcat car_driver_record)
-       (r/map #(province_station % 300))
+       (r/mapcat (partial car_driver_record start end))
+       (r/map (partial province_station seconds))
        (r/map frequencies)
        (r/fold merge-counts)))
 
-(defn save_freq
+(defn save-freq
   "保存省界收费站及频率"
   [f_name]
-  (let [freq (parse_all_shengjie_sfz)]
+  (let [freq (parse_all_shengjie_sfz 100 "2016-07-01" "2016-08-01")]
     (with-open [wr (io/writer f_name)]
       (doseq [[k v] (vec freq)]
         (.write wr (str k ":" v "\n"))))))
@@ -149,6 +184,7 @@
         (recur c (conj! result coll))))))
 
 (defn create-gaode-table
+  "创建高德收费站表"
   []
   (db-do-commands (db-conn)
                   ["drop table gaode_station"
@@ -168,9 +204,33 @@
                                       [:tag "VARCHAR2(80)"]])
                    "create index IDX_GAODE_LNGLAT on gaode_station(lng,lat)"
                    "create index IDX_GAODE_PROVINCE on gaode_station(pcode,citycode)"]))
+
+(defn create-baidu-table
+  "创建百度收费站表"
+  []
+  (db-do-commands (db-conn)
+                  ["drop table baidu_station"
+                   (create-table-ddl :baidu_station
+                                     [[:station "VARCHAR2(80)"]
+                                      [:attr "VARCHAR2(64)"]
+                                      [:lng "NUMBER(16,6)"]
+                                      [:lat "NUMBER(16,6)"]
+                                      [:g_lng "NUMBER(16,6)"]
+                                      [:g_lat "NUMBER(16,6)"]
+                                      [:province "VARCHAR2(32)"]
+                                      [:pcode "VARCHAR2(8)"]
+                                      [:city "VARCHAR2(64)"]
+                                      [:address "VARCHAR2(128)"]
+                                      [:tags "VARCHAR2(80)"]])
+                   "create index IDX_BAIDU_LANLAT on baidu_station(lng,lat)"]))
+
 (defn insert-gaode-data
   ([] 0)
   ([i coll] (+ i (count (insert-multi! (db-conn) :gaode_station coll)))))
+
+(defn insert-baidu-data
+  ([] 0)
+  ([i coll] (+ i (count (insert-multi! (db-conn) :baidu_station coll)))))
 
 (defn count_num
   ([] 0)
@@ -183,11 +243,150 @@
        (mapcat (fn [keys] (map (fn [x y] [x y]) keys (wcar* (mapv car/hgetall* keys))))) ;[([k1,v1] [k2,v2],...),...]
        (partition-all 20)
        vec
-       (r/map (fn [coll] (prn (count coll))(map #(apply gaode %) coll)))
-       (r/fold + insert-gaode-data)
-       ))
+       (r/map (fn [coll] (map #(apply gaode %) coll)))
+       (r/fold + insert-gaode-data)))
+
+(defn- convert-baidu-gaode
+  [m]
+  (let [{lng :lng lat :lat} m]
+    (merge m (zipmap [:g_lng :g_lat] (bd09-gcj02 [lng lat])))))
+
+(defn save-baidu
+  []
+  (->> (wcar* (car/keys "poi:*"))
+       (partition-all 256)
+       (mapcat (fn [keys] (map (fn [x y] [x y]) keys (wcar* (mapv car/hgetall* keys))))) ;[([k1,v1] [k2,v2],...),...]
+       (partition-all 20)
+       vec
+       (r/map (fn [coll] (map #(apply gaode %) coll)))
+       ;(r/map (fn [coll] (map convert-baidu-gaode coll)))
+       (r/fold + insert-baidu-data)))
+
+(defn write-gaode-poi
+  "添加百度坐标对应的高德坐标"
+  []
+  (reduce +
+          (->> (wcar* (car/keys "poi:*"))
+               vec
+               (r/map (fn [k] [k (split k #":")]))
+               (r/map (fn [[k coll]] [k (zipmap [:g_lng :g_lat] (bd09-gcj02 (mapv #(Float/parseFloat %) (drop 2 coll))))]))
+               (r/foldcat)
+               (partition-all 256)
+               (map (fn [coll] (wcar* (mapv #(car/hmset* (first %) (last %)) coll))))
+               (map count))))
+
+(def province {"江西省"	"360000",
+               "北京市"	"110000",
+               "海南省"	"460000",
+               "广东省"	"440000",
+               "黑龙江省" "230000",
+               "广西壮族自治区"	"450000",
+               "上海市"	"310000",
+               "河北省"	"130000",
+               "吉林省"	"220000",
+               "河南省"	"410000",
+               "宁夏回族自治区"	"640000",
+               "四川省"	"510000",
+               "天津市"	"120000",
+               "内蒙古自治区"	"150000",
+               "云南省"	"530000",
+               "安徽省"	"340000",
+               "福建省"	"350000",
+               "山东省"	"370000",
+               "甘肃省"	"620000",
+               "贵州省"	"520000",
+               "江苏省"	"320000",
+               "重庆市"	"500000",
+               "新疆维吾尔自治区"	"650000",
+               "青海省"	"630000",
+               "山西省"	"140000",
+               "湖北省"	"420000",
+               "湖南省"	"430000",
+               "陕西省"	"610000",
+               "辽宁省"	"210000",
+               "浙江省"	"330000",
+               "香港特别行政区"	"810000"})
+
+(defn baidu-write-pcode
+  "添加省份编码"
+  []
+  (->> (wcar* (car/keys "poi:*"))
+       (partition-all 128)
+       (r/map (fn [keys] (map (fn [x y] [x y]) keys (wcar* (mapv car/hgetall* keys))))) ;[([k1,v1] [k2,v2],...),...]
+       (r/map (fn [coll] (map (fn [[k v]] [k (assoc v :pcode (province (v "province")))]) coll)))
+       (r/map (fn [coll] (wcar* (mapv #(car/hmset* (first %) (last %)) coll))))
+       (r/map count)
+       (r/reduce + 0)))
+
+(defn parse_poi
+  [key]
+  (mapv #(Float/parseFloat %) (drop 2 (split key #":"))))
+
+(defn station_distance
+  [in out]
+  (let [in_station (wcar* (car/keys (str "GAODE:" in "*入口*")))
+        out_station (wcar* (car/keys (str "GAODE:*" out "*")))]
+    (doseq [x in_station y out_station]
+      (prn (str x " to " y  " is " (distance_pois (parse_poi x) (parse_poi y)))))))
 
 (defn -main
   [& args]
-  (create-gaode-table)
-  (save-gaode))
+  (save-freq "freq.txt"))
+
+(def stop-words
+  (doto (CharArraySet. 8 true)
+    (.add "收费站")
+    (.add "方向")
+    (.add "高速")))
+
+(defn parse-station
+  [word]
+  (with-open [a (SmartChineseAnalyzer. stop-words) ts (.tokenStream a "station" word)] 
+    (let [offset (.addAttribute ts OffsetAttribute)]
+      (.reset ts)
+      (loop [c (.incrementToken ts)]
+        (when c
+          (prn (.toString offset))
+          (recur (.incrementToken ts)))))))
+
+(defn generate-station-index
+  "建立站点中文索引"
+  [file]
+  (with-open [analyzer (SmartChineseAnalyzer. stop-words)
+              directory (FSDirectory/open (Paths/get file))
+              indexWriter (IndexWriter. directory (IndexWriterConfig. analyzer))]
+    (let [gaode (query (db-conn) ["select station,attr,lng,lat,pcode from gaode_station"])
+          baidu (query (db-conn) ["select station,attr,lng,lat,pcode from baidu_station"])]
+      (doseq [c gaode]
+        (.addDocument indexWriter
+                      (doto (Document.)
+                        (.add (StringField. "key" (join ":" ["GAODE"  (if (:attr c nil) (str (:station c) "(" (:attr c) ")") (:station c)) (:lng c) (:lat c)]) Field$Store/YES))
+                        (.add (TextField. "station" (str (:station c) (:attr c)) Field$Store/YES))
+                        (.add (StringField. "pcode" (:pcode c) Field$Store/YES)))))
+      (doseq [c baidu]
+        (.addDocument indexWriter
+                      (doto (Document.)
+                        (.add (StringField. "key" (join ":" ["poi"  (if (:attr c nil) (str (:station c) "(" (:attr c) ")") (:station c)) (:lng c) (:lat c)]) Field$Store/YES))
+                        (.add (TextField. "station" (str (:station c) (:attr c)) Field$Store/YES))
+                        (.add (StringField. "pcode" (:pcode c) Field$Store/YES))))))))
+
+(defn search-station-index
+  "搜索站点名"
+  [file station]
+  (with-open [analyzer (SmartChineseAnalyzer. stop-words)
+              indexReader (DirectoryReader/open (FSDirectory/open (Paths/get file)))]
+    (let [searcher (IndexSearcher. indexReader)
+          parse (QueryParser. "station" analyzer)
+          query (.parse parse station)
+          results (.search searcher query, 5)
+          hits (.-scoreDocs results)]
+      (prn (.toString query))
+      (doseq [hit hits]
+        (let [doc (.doc searcher (.-doc hit))]
+          (prn (.get doc "key"))
+          (prn (.get doc "station"))
+          (prn (.get doc "pcode")))))))
+
+(defn search-index
+  [x]
+  (search-station-index (java.net.URI. "file:///D:/lucene-index")))

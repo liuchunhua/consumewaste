@@ -11,6 +11,11 @@
                  [com.oracle/ojdbc6 "12.1.0.2.0"]
                  [com.mchange/c3p0 "0.9.2.1"]
                  [com.taoensso/carmine "2.15.0"]
+                 [org.apache.lucene/lucene-core "6.3.0"]
+                 [org.apache.lucene/lucene-analyzers-common "6.3.0"]
+                 [org.apache.lucene/lucene-analyzers-smartcn"6.3.0"]
+                 [org.apache.lucene/lucene-queryparser "6.3.0"]
+                 [org.apache.lucene/lucene-queries"6.3.0"]
                  ]
-  :profiles {:dev {:plugins [[cider/cider-nrepl "0.14.0-SNAPSHOT"]]}}
+  :profiles {:dev {:plugins [[cider/cider-nrepl "0.15.0-SNAPSHOT"]]}}
   :local-repo "D:\\m2")
