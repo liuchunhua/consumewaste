@@ -1,7 +1,7 @@
 (ns clj-consumewaste.core
   (:use
    [clojure.java.jdbc :exclude (resultset-seq)]
-   [clojure.string :as string  :only (join split)])
+   [clojure.string :as str  :only (join split)])
   (:require [clojure.core.reducers :as r]
             [clojure.java.io :as io]
             [taoensso.carmine :as car :refer (wcar)]
@@ -73,6 +73,17 @@
     [(round (+ (* z (Math/cos theta)) 0.0065) 6)
      (round (+ (* z (Math/sin theta)) 0.006) 6)]))
 
+(defn distance_pois
+  "计算连个坐标之间的直线距离"
+  [^floats [lng1,lat1] ^floats [lng2, lat2]]
+  (let [radians (/ Math/PI 180)
+        lat (* (/ (- lat1 lat2) 2) radians)
+        lng (* (/ (- lng1 lng2) 2) radians)
+        lat_1 (* lat1 radians)
+        lat_2 (* lat2 radians)
+        a (+ (Math/pow (Math/sin lat) 2) (* (Math/cos lat_1) (Math/cos lat_2) (Math/pow (Math/sin lng) 2)))
+        c (* 2 (Math/atan2 (Math/sqrt a) (Math/sqrt (- 1 a))))]
+    (* 6371.008 c)))
 (defn carno_extrace
   "获取消费记录中所有的卡号"
   [start end]
@@ -82,7 +93,7 @@
   "获得车辆的行驶记录"
   [start end carno_coll]
   (let [params (join " ," (repeat (count carno_coll) "?"))
-        sql (join ["select distinct CARDNO, INSTATION, INTIME, OUTSTATION, OUTTIME from DA_ETC_CONSUME_PARSE where cardno in ("
+        sql (join ["select distinct CARDNO, ENPROVID, INSTATION, INTIME, OUTSTATION, OUTTIME from DA_ETC_CONSUME_PARSE where cardno in ("
                    params
                    ") and savetime > to_date(?,'YYYY-MM-DD') and savetime < to_date(?,'YYYY-MM-DD')"
                    "and intime is not null and outtime is not null"
@@ -118,13 +129,14 @@
   record 车辆行驶记录
   seconds 过省界的时间上线"
   [seconds record]
-  (let [rest (rest_time record)
-        is_province (map-indexed (fn [idx itm] [idx (and (> itm 0) (< itm seconds))]) rest);;停留时间小于预定时间则是省界收费站
-        ]
+  (let [rest-time (rest_time record)
+        is_province (map-indexed (fn [idx itm] [idx (and (> itm 0) (< itm seconds))]) rest-time);;停留时间小于预定时间则是省界收费站
+]
     (->> is_province
-         (filter (fn [[idx itm]] itm))
-         (map (fn [[idx _]] [(-> record (get idx) :outstation) (-> record (get (inc idx)) :instation)])) ;'([instation, outstation],...)
-)))
+         (r/filter (fn [[idx itm]] itm))
+         (r/filter (fn [[idx _]] (not= (-> record (get idx) :enprovid) (-> record (get (inc idx)) :enprovid)))) ;'([instation, outstation],...)
+         (r/map (fn [[idx _]] [(-> record (get idx) :outstation) (-> record (get (inc idx)) :instation)])) ;'([instation, outstation],...)
+         (into []))))
 
 (defn print_province_station
   [record seconds]
@@ -135,18 +147,6 @@
       (when (true? e)
         (prn (-> record (get i) (select-keys [:outstation :outtime])))
         (prn (-> record (get (inc i)) (select-keys [:instation :intime])))))))
-
-(defn distance_pois
-  "计算连个坐标之间的直线距离"
-  [^floats [lng1,lat1] ^floats [lng2, lat2]]
-  (let [radians (/ Math/PI 180)
-        lat (* (/ (- lat1 lat2) 2) radians)
-        lng (* (/ (- lng1 lng2) 2) radians)
-        lat_1 (* lat1 radians)
-        lat_2 (* lat2 radians)
-        a (+ (Math/pow (Math/sin lat) 2) (* (Math/cos lat_1) (Math/cos lat_2) (Math/pow (Math/sin lng) 2)))
-        c (* 2 (Math/atan2 (Math/sqrt a) (Math/sqrt (- 1 a))))]
-    (* 6371.008 c)))
 
 (defn merge-counts
   ([] {})
@@ -174,8 +174,8 @@
   [key value]
   (let [col (split key #":")
         name-map (zipmap [:station :attr] (split (col 1) #"[()]"))
-        lng (Float/parseFloat (col 2))
-        lat (Float/parseFloat (col 3))]
+        lng (Double/valueOf (col 2))
+        lat (Double/valueOf (col 3))]
     (merge value name-map {:lng lng,:lat lat})))
 
 (defn redis-keyscan
@@ -327,10 +327,6 @@
   [key]
   (mapv #(Float/parseFloat %) (drop 2 (split key #":"))))
 
-(defn -main
-  [& args]
-  (save-freq "freq.txt"))
-
 (def stop-words
   (doto (CharArraySet. 8 true)
     (.add "收费站")
@@ -347,51 +343,65 @@
           (prn (.toString offset))
           (recur (.incrementToken ts)))))))
 
+(defn- db-gaode-station
+  []
+  (query (db-conn) ["select station,attr,lng,lat,pcode from gaode_station"]))
+(defn- gaode-key
+  [m]
+  (join ":" ["GAODE"  (if (:attr m nil) (str (:station m) "(" (:attr m) ")") (:station m)) (:lng m) (:lat m)]))
+(defn- db-baidu-station
+  []
+  (query (db-conn) ["select station,attr,lng,lat,pcode from baidu_station"]))
+(defn- baidu-key
+  [m]
+  (join ":" ["poi"  (if (:attr m nil) (str (:station m) "(" (:attr m) ")") (:station m)) (:lng m) (:lat m)]))
 (defn generate-station-index
   "建立站点中文索引"
   [file]
   (with-open [analyzer (SmartChineseAnalyzer. stop-words)
               directory (FSDirectory/open (Paths/get file))
               indexWriter (IndexWriter. directory (IndexWriterConfig. analyzer))]
-    (let [gaode (query (db-conn) ["select station,attr,lng,lat,pcode from gaode_station"])
-          baidu (query (db-conn) ["select station,attr,lng,lat,pcode from baidu_station"])]
+    (let [gaode (db-gaode-station)
+          baidu (db-baidu-station)]
       (doseq [c gaode]
         (.addDocument indexWriter
                       (doto (Document.)
-                        (.add (StringField. "key" (join ":" ["GAODE"  (if (:attr c nil) (str (:station c) "(" (:attr c) ")") (:station c)) (:lng c) (:lat c)]) Field$Store/YES))
+                        (.add (StringField. "key" (gaode-key c) Field$Store/YES))
                         (.add (TextField. "station" (:station c) Field$Store/YES))
                         (.add (TextField. "attr" (if (:attr c) (:attr c) "") Field$Store/NO))
                         (.add (StringField. "pcode" (:pcode c) Field$Store/YES)))))
       (doseq [c baidu]
         (.addDocument indexWriter
                       (doto (Document.)
-                        (.add (StringField. "key" (join ":" ["poi"  (if (:attr c nil) (str (:station c) "(" (:attr c) ")") (:station c)) (:lng c) (:lat c)]) Field$Store/YES))
+                        (.add (StringField. "key" (baidu-key c) Field$Store/YES))
                         (.add (TextField. "station" (:station c) Field$Store/NO))
                         (.add (TextField. "attr" (if (:attr c) (:attr c) "") Field$Store/NO))
                         (.add (StringField. "pcode" (:pcode c) Field$Store/YES))))))))
 
 (defn search-station-index
   "搜索站点名"
-  [file station]
+  [file station province]
   (with-open [analyzer (SmartChineseAnalyzer. stop-words)
               indexReader (DirectoryReader/open (FSDirectory/open (Paths/get file)))]
     (let [searcher (IndexSearcher. indexReader)
           parse (QueryParser. "station" analyzer)
-          query (.parse parse (str station))
-          results (.search searcher query 5)
-          hits (.-scoreDocs results)]
+          query (.parse parse (str station " attr:" station " pcode:" province))
+          results (.search searcher query 10)
+          hits (.-scoreDocs results)
+          station (transient [])]
       (prn (.toString query))
       (doseq [hit hits]
         (let [doc (.doc searcher (.-doc hit))
-              score (.-score hit)
-              explanation (.explain searcher query (.-doc hit))]
-          (prn score)
-          (prn (.get doc "key"))
-          (prn (.get doc "pcode")))))))
+              score (.-score hit)]
+          (conj! station {:score score, :key (.get doc "key") :pcode (.get doc "pcode")})))
+      (persistent! station))))
+
+(defn station-lucene-searcher
+  [file] (IndexSearcher. (DirectoryReader/open (FSDirectory/open (Paths/get file)))))
 
 (defn search-index
-  [x]
-  (search-station-index (java.net.URI. "file:///D:/lucene-index") x))
+  [x province]
+  (search-station-index (java.net.URI. "file:///D:/lucene-index") x province))
 
 (defn genetater-index
   []
@@ -399,27 +409,113 @@
 
 (defn in-out-station
   [start end]
-  (merge (query (db-conn) ["SELECT ENPROVID,INSTATION, OUTSTATION, avg((OUTTIME - INTIME)*24) AS SPENDTIME FROM DA_ETC_CONSUME_PARSE
-where intime > to_date(?,'YYYY-MM-DD') and intime < to_date(?,'YYYY-MM-DD') GROUP BY ENPROVID,INSTATION, OUTSTATION" start end]) {:instation_poi [], :outstation_poi []}))
+  (query (db-conn) ["SELECT ENPROVID||'0000' AS PCODE,INSTATION, OUTSTATION, avg((OUTTIME - INTIME)*24) AS SPENDTIME FROM DA_ETC_CONSUME_PARSE
+where intime > to_date(?,'YYYY-MM-DD') and intime < to_date(?,'YYYY-MM-DD') GROUP BY ENPROVID,INSTATION, OUTSTATION" start end]))
 
 (defn fix-station
   [name]
   (str (string/replace name #"消费站|站" "") "收费站"))
 
-(defn start-station-process
+(defn gaode-station
+  [station province]
+  (query (db-conn) ["select station, attr, lng, lat, pcode from gaode_station where station = ? and pcode = ?" (fix-station station) province]))
+
+(defn baidu-station
+  [station province]
+  (query (db-conn) ["select station, attr, g_lng as lng, g_lat as lat, pcode from baidu_station where station = ? and pcode = ?" (fix-station station) province]))
+
+(defn save-station-poi
+  "保存区间站点可能的坐标"
   [channel]
-  (go (doseq [m (take 5 (in-out-station "2016-07-01" "2016-07-05"))]
-        (>! channel m)))
-  channel)
+  (go (while true
+        (let [condition (<! channel)
+              spendtime (condition :spendtime)
+              in_poi (condition :in_poi [])
+              out_poi (condition :out_poi [])]
+          (->> (for [in in_poi out out_poi] {:in in :out out})
+               (map (fn [m] (assoc m :speed (if (zero? spendtime) 0 (/ (distance_pois (mapv (m :in) [:lng :lat]) (mapv (m :out) [:lng :lat])) spendtime)))))
+               (assoc condition :road)
+               ((fn [m] (dissoc m :out_poi :in_poi)))
+               ((fn [m] (wcar* (car/set (join ":" (mapv condition [:pcode :instation :outstation])) m)))))))))
 
-(defn redis-station
-  [m]
-  (let [coll (wcar* (car/keys (str "GAODE:" (fix-station (m "instation")) "*")) (car/keys (str "GAODE:" (fix-station (m "outstation")) "*")))]
-    (merge m {:instation_poi (first coll) :outstation_poi (last coll)})))
+(defn- process-lucene-searchresult
+  [searcher station province]
+  (let [parse (QueryParser. "station" (SmartChineseAnalyzer. stop-words))
+        query (.parse parse (str station " attr:" station " pcode:" province))
+        results (.search searcher query 10)
+        hits (.-scoreDocs results)
+        station (transient [])]
+    (doseq [hit hits]
+      (let [doc (.doc searcher (.-doc hit))
+            score (.-score hit)]
+        (conj! station {:score score, :key (.get doc "key") :pcode (.get doc "pcode")})))
+    (let [coll (persistent! station)
+          max_score (:score (apply max-key :score coll))]
+      (->> coll
+           (r/filter #(<= max_score (% :score)))
+           (r/map :key)
+           (r/map #(gaode % {:pcode province}))
+           (into [])))))
 
-(defn station-process
-  [in]
-  (let [channel (chan 10)]
-    (go (while true (>! channel (redis-station (<! in)))))
-    channel))
+(defn search-in-lucene
+  "在lucene索引处理站点信息"
+  [in-channel out-channel]
+  (let [searcher (station-lucene-searcher (java.net.URI. "file:///D:/lucene-index"))]
+    (go (while true
+          (let [condition (<! in-channel)
+                instation (condition :instation)
+                outstation (condition :outstation)
+                province (condition :pcode)
+                in_poi (condition :in_poi [])
+                out_poi (condition :out_poi [])
+                search (memoize process-lucene-searchresult)]
+            (>! out-channel (assoc condition :in_poi (if (seq in_poi) in_poi (search searcher instation province))
+                                   :out_poi (if (seq out_poi) out_poi (search searcher outstation province)))))))))
 
+(defn search-gaode-station
+  [in-channel out-channel]
+  (let []
+    (go (while true
+          (let [condition (<! in-channel)
+                instation (condition :instation)
+                outstation (condition :outstation)
+                province (condition :pcode)
+                in_poi (condition :in_poi [])
+                out_poi (condition :out_poi [])
+                search (memoize gaode-station)]
+            (>! out-channel (assoc condition :in_poi (if (seq in_poi) in_poi (search instation province))
+                                   :out_poi (if (seq out_poi) out_poi (search outstation province)))))))))
+(defn search-baidu-station
+  [in-channel out-channel]
+  (let []
+    (go (while true
+          (let [condition (<! in-channel)
+                instation (condition :instation)
+                outstation (condition :outstation)
+                province (condition :pcode)
+                in_poi (condition :in_poi [])
+                out_poi (condition :out_poi [])
+                search (memoize baidu-station)]
+            (>! out-channel (assoc condition :in_poi (if (seq in_poi) in_poi (search instation province))
+                                   :out_poi (if (seq out_poi) out_poi (search outstation province)))))))))
+
+(defn process-station
+  []
+  (let [gaode-chan (chan 10)
+        baidu-chan (chan 10)
+        lucene-chan (chan 10)
+        final-chan (chan 10)]
+    (save-station-poi final-chan)
+    (search-in-lucene lucene-chan final-chan)
+    (search-baidu-station baidu-chan lucene-chan)
+    (search-gaode-station gaode-chan baidu-chan)
+    gaode-chan))
+
+(defn -main
+  [& args]
+  (let [c (process-station)
+        result (in-out-station "2016-07-01" "2016-07-08")]
+    (doseq [m result]
+      (when (zero? (wcar* (car/exists (join ":" (mapv m [:pcode :instation :outstation])) )))
+        (prn m)(>!! c m)))
+    (close! c)))
