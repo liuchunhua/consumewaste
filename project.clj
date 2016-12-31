@@ -18,4 +18,6 @@
                  [org.apache.lucene/lucene-queries"6.3.0"]
                  ]
   :profiles {:dev {:plugins [[cider/cider-nrepl "0.15.0-SNAPSHOT"]]}}
-  :local-repo "D:\\m2")
+  :local-repo "D:\\m2"
+  :main clj-consumewaste.core
+  :aot [clj-consumewaste.core])
