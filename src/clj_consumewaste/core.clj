@@ -373,22 +373,23 @@
                         (.add (TextField. "station" (:station c) Field$Store/YES))
                         (.add (TextField. "attr" (if (:attr c) (:attr c) "") Field$Store/NO))
                         (.add (StringField. "pcode" (:pcode c) Field$Store/YES)))))
-      (doseq [c baidu]
-        (.addDocument indexWriter
-                      (doto (Document.)
-                        (.add (StringField. "key" (baidu-key c) Field$Store/YES))
-                        (.add (TextField. "station" (:station c) Field$Store/NO))
-                        (.add (TextField. "attr" (if (:attr c) (:attr c) "") Field$Store/NO))
-                        (.add (StringField. "pcode" (:pcode c) Field$Store/YES))))))))
+      ;; (doseq [c baidu]
+      ;;   (.addDocument indexWriter
+      ;;                 (doto (Document.)
+      ;;                   (.add (StringField. "key" (baidu-key c) Field$Store/YES))
+      ;;                   (.add (TextField. "station" (:station c) Field$Store/NO))
+      ;;                   (.add (TextField. "attr" (if (:attr c) (:attr c) "") Field$Store/NO))
+      ;;                   (.add (StringField. "pcode" (:pcode c) Field$Store/YES)))))
+      )))
 
 (defn search-station-index
   "搜索站点名"
-  [file station province]
+  [file word]
   (with-open [analyzer (SmartChineseAnalyzer. stop-words)
               indexReader (DirectoryReader/open (FSDirectory/open (Paths/get file)))]
     (let [searcher (IndexSearcher. indexReader)
           parse (QueryParser. "station" analyzer)
-          query (.parse parse (str station " attr:" station " pcode:" province))
+          query (.parse parse word)
           results (.search searcher query 10)
           hits (.-scoreDocs results)
           station (transient [])]
@@ -403,8 +404,8 @@
   [file] (IndexSearcher. (DirectoryReader/open (FSDirectory/open (Paths/get file)))))
 
 (defn search-index
-  [x province]
-  (search-station-index (java.net.URI. "file:///D:/lucene-index") x province))
+  [x]
+  (search-station-index (java.net.URI. "file:///D:/lucene-index") x))
 
 (defn genetater-index
   []
@@ -439,15 +440,15 @@ where intime > to_date(?,'YYYY-MM-DD') and intime < to_date(?,'YYYY-MM-DD') GROU
               out_poi (condition :out_poi [])]
           (->> (for [in in_poi out out_poi] {:in in :out out})
                (map (fn [m] (assoc m :speed (if (zero? spendtime) 0 (/ (distance_pois (mapv (m :in) [:lng :lat]) (mapv (m :out) [:lng :lat])) spendtime)))))
-               (filter (fn [m] (< (m :speed) 120.0)))
+               ;;(filter (fn [m] (< (m :speed) 120.0)))
                (assoc condition :road)
                ((fn [m] (dissoc m :out_poi :in_poi)))
                ((fn [m] (wcar* (car/set (join ":" (mapv condition [:pcode :instation :outstation])) m)))))))))
 
 (defn- process-lucene-searchresult
-  [searcher station province]
+  [searcher station province entry]
   (let [parse (QueryParser. "station" (SmartChineseAnalyzer. stop-words))
-        query (.parse parse (str station " attr:" station " pcode:" province))
+        query (.parse parse (str station "^2 attr:" station " -attr:" entry " +pcode:" province))
         results (.search searcher query 10)
         hits (.-scoreDocs results)
         station (transient [])]
@@ -460,7 +461,7 @@ where intime > to_date(?,'YYYY-MM-DD') and intime < to_date(?,'YYYY-MM-DD') GROU
       (->> coll
            (r/filter #(<= max_score (% :score)))
            (r/map :key)
-           (r/map #(gaode % {:pcode province}))
+           (r/map #(gaode % {:pcode province :score max_score}))
            (into [])))))
 
 (defn search-in-lucene
@@ -475,8 +476,8 @@ where intime > to_date(?,'YYYY-MM-DD') and intime < to_date(?,'YYYY-MM-DD') GROU
                 in_poi (condition :in_poi [])
                 out_poi (condition :out_poi [])
                 search (memoize process-lucene-searchresult)]
-            (>! out-channel (assoc condition :in_poi (if (seq in_poi) in_poi (search searcher instation province))
-                                   :out_poi (if (seq out_poi) out_poi (search searcher outstation province)))))))))
+            (>! out-channel (assoc condition :in_poi (if (seq in_poi) in_poi (search searcher instation province "出口"))
+                                   :out_poi (if (seq out_poi) out_poi (search searcher outstation province "入口")))))))))
 
 (defn search-gaode-station
   [in-channel out-channel]
@@ -526,7 +527,7 @@ where intime > to_date(?,'YYYY-MM-DD') and intime < to_date(?,'YYYY-MM-DD') GROU
   [keys]
   (let [values (wcar* :as-pipeline (mapv #(car/get %) keys))]
     (->> values
-         (filter (fn [v] (> (.length (str (v :spendtime))) 6)))
+         ;;(filter (fn [v] (> (.length (str (v :spendtime))) 6)))
          ((fn [vs] (wcar* (mapv #(car/del (join ":" (mapv % [:pcode :instation :outstation])) %) vs))))
          )))
 
@@ -579,5 +580,5 @@ where intime > to_date(?,'YYYY-MM-DD') and intime < to_date(?,'YYYY-MM-DD') GROU
     )
   ;; (let [pcode (vals province)]
   ;;   (doseq [p pcode]
-  ;;     (redis-keyscan (join ":" [p "*"]) 300 hyv-speed)))
+  ;;     (redis-keyscan (join ":" [p "*"]) 300 (fn [keys] (wcar* (mapv #(car/del %) keys))))))
 )
