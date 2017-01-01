@@ -438,6 +438,7 @@ where intime > to_date(?,'YYYY-MM-DD') and intime < to_date(?,'YYYY-MM-DD') GROU
               spendtime (condition :spendtime)
               in_poi (condition :in_poi [])
               out_poi (condition :out_poi [])]
+          (prn condition)
           (->> (for [in in_poi out out_poi] {:in in :out out})
                (map (fn [m] (assoc m :speed (if (zero? spendtime) 0 (/ (distance_pois (mapv (m :in) [:lng :lat]) (mapv (m :out) [:lng :lat])) spendtime)))))
                ;;(filter (fn [m] (< (m :speed) 120.0)))
@@ -460,8 +461,8 @@ where intime > to_date(?,'YYYY-MM-DD') and intime < to_date(?,'YYYY-MM-DD') GROU
           max_score (:score (apply max-key :score coll))]
       (->> coll
            (r/filter #(<= max_score (% :score)))
-           (r/map :key)
-           (r/map #(gaode % {:pcode province :score max_score}))
+           (r/map #(merge % (gaode (:key %) {})))
+           (r/map #(dissoc % :key))
            (into [])))))
 
 (defn search-in-lucene
@@ -476,8 +477,9 @@ where intime > to_date(?,'YYYY-MM-DD') and intime < to_date(?,'YYYY-MM-DD') GROU
                 in_poi (condition :in_poi [])
                 out_poi (condition :out_poi [])
                 search (memoize process-lucene-searchresult)]
-            (>! out-channel (assoc condition :in_poi (if (seq in_poi) in_poi (search searcher instation province "出口"))
-                                   :out_poi (if (seq out_poi) out_poi (search searcher outstation province "入口")))))))))
+            (try (>! out-channel (assoc condition :in_poi (if (seq in_poi) in_poi (search searcher instation province "出口"))
+                                        :out_poi (if (seq out_poi) out_poi (search searcher outstation province "入口"))))
+                 (catch Exception e (prn e))))))))
 
 (defn search-gaode-station
   [in-channel out-channel]
