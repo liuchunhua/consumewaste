@@ -47,8 +47,8 @@
 
 (defn db-conn [] @pooled-db)
 
-(def server1-conn {:pool {} :spec {:host "10.180.29.70" :port 6379}}) ; See `wcar` docstring for opts
-(defmacro wcar* [& body] `(car/wcar server1-conn ~@body))
+(def server2-conn {:pool {} :spec {:host "10.190.1.35" :port 6379}}) ; See `wcar` docstring for opts
+(defmacro wcar* [& body] `(car/wcar server2-conn ~@body))
 
 (defn round
   [n m]
@@ -380,7 +380,7 @@
       ;;                   (.add (TextField. "station" (:station c) Field$Store/NO))
       ;;                   (.add (TextField. "attr" (if (:attr c) (:attr c) "") Field$Store/NO))
       ;;                   (.add (StringField. "pcode" (:pcode c) Field$Store/YES)))))
-      )))
+)))
 
 (defn search-station-index
   "搜索站点名"
@@ -423,7 +423,7 @@ where intime > to_date(?,'YYYY-MM-DD') and intime < to_date(?,'YYYY-MM-DD') GROU
 (defn gaode-station
   [station province entry]
   (j/with-db-connection [conn (db-conn)]
-    (j/query conn ["select station, attr, lng, lat, pcode from gaode_station where station = ? and pcode = ? and attr not like '%'||?||'%'" (fix-station station) province entry])))
+    (j/query conn ["select station, attr, lng, lat, pcode from gaode_station where station = ? and pcode = ? and (attr is null or attr not like '%'||?||'%')" (fix-station station) province entry])))
 
 (defn baidu-station
   [station province]
@@ -468,7 +468,8 @@ where intime > to_date(?,'YYYY-MM-DD') and intime < to_date(?,'YYYY-MM-DD') GROU
 (defn search-in-lucene
   "在lucene索引处理站点信息"
   [in-channel out-channel]
-  (let [searcher (station-lucene-searcher (java.net.URI. "file:///D:/lucene-index"))]
+  (let [index_dir (if (= "Windows_NT" (System/getenv "os")) "file:///D:/lucene-index" "file:////home/etc/lucene-index")
+        searcher (station-lucene-searcher (java.net.URI. index_dir))]
     (go (while true
           (let [condition (<! in-channel)
                 instation (condition :instation)
@@ -530,9 +531,7 @@ where intime > to_date(?,'YYYY-MM-DD') and intime < to_date(?,'YYYY-MM-DD') GROU
   (let [values (wcar* :as-pipeline (mapv #(car/get %) keys))]
     (->> values
          ;;(filter (fn [v] (> (.length (str (v :spendtime))) 6)))
-         ((fn [vs] (wcar* (mapv #(car/del (join ":" (mapv % [:pcode :instation :outstation])) %) vs))))
-         )))
-
+         ((fn [vs] (wcar* (mapv #(car/del (join ":" (mapv % [:pcode :instation :outstation])) %) vs)))))))
 
 ;; 分析省界站
 ;; (defn -main
@@ -569,18 +568,55 @@ where intime > to_date(?,'YYYY-MM-DD') and intime < to_date(?,'YYYY-MM-DD') GROU
 (defn -main
   [& args]
   (let [c (process-station)
-        sql "select * from PCODE_INSTATION_OUTSTATION_8"
-        ]
+        sql "select * from PCODE_INSTATION_OUTSTATION_7"]
     (loop [page 1]
       (when-let [coll (seq (oracle-page-query sql page 2000))]
         (doseq [m coll]
-          (when (zero? (wcar* (car/exists (join ":" (mapv m [:pcode :instation :outstation])) )))
+          (when true;;(zero? (wcar* (car/exists (join ":" (mapv m [:pcode :instation :outstation])))))
             (prn (assoc m :spendtime (round (:spendtime m) 3))) (>!! c (assoc m :spendtime (round (:spendtime m) 3)))))
         (recur (inc page))))
-    (close! c)
-    
-    )
+    (close! c))
   ;; (let [pcode (vals province)]
   ;;   (doseq [p pcode]
   ;;     (redis-keyscan (join ":" [p "*"]) 300 (fn [keys] (wcar* (mapv #(car/del %) keys))))))
 )
+
+;; (defn -main
+;;   "抽取所有路径坐标"
+;;   [& args]
+;;   (with-open [writer (io/writer "poitopoi.txt")]
+;;     (doseq [p (vals province)]
+;;       (redis-keyscan (join ":" [p "*"]) 300
+;;                      (fn [keys]
+;;                        (let [values (wcar* :as-pipeline (mapv #(car/get %) keys))
+;;                              maps (mapcat #(:road %) values)]
+;;                          (doseq [m maps]
+;;                            (prn m)
+;;                            (.write writer (join ":" [(get-in m [:in :lng])
+;;                                                      (get-in m [:in :lat])
+;;                                                      (get-in m [:out :lng])
+;;                                                      (get-in m [:out :lat])
+;;                                                      "\n"])))))))))
+
+;; (defn save-another-redis
+;;   [& args]
+;;   (redis-keyscan "poi:*" 300
+;;                  (fn [keys]
+;;                    (let [values (wcar* :as-pipeline (mapv #(car/hgetall* %) keys))]
+;;                      (wcarr* (mapv #(car/hmset* %1 %2) keys values))))))
+
+(defn min-path
+  [pcode instation outstation]
+  (let [key (join ":" [pcode instation outstation])
+        value (wcar* (car/get key))
+        road (:road value)]
+    (->> road
+         (map (fn [m] (join ":" ["DC"
+                                   (get-in m [:in :lng])
+                                   (get-in m [:in :lat])
+                                   (get-in m [:out :lng])
+                                   (get-in m [:out :lat])])))
+         ((fn [keys] (map (fn [x y] (assoc x :distance (Double/valueOf y))) road (wcar* :as-pipeline (mapv #(car/get %) keys)))))
+         ;;(sort-by :distance)
+         ;;(first)
+         )))
