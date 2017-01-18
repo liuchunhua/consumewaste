@@ -9,7 +9,8 @@
             [clojure.core.async
              :as a
              :refer [>! <! >!! <!! go chan buffer close! thread
-                     alts! alts!! timeout]])
+                     alts! alts!! timeout]]
+            [clojure.tools.logging :as log])
   (:import com.mchange.v2.c3p0.ComboPooledDataSource
            java.sql.SQLException
            (org.apache.lucene.analysis.cn.smart SmartChineseAnalyzer)
@@ -47,7 +48,7 @@
 
 (defn db-conn [] @pooled-db)
 
-(def server2-conn {:pool {} :spec {:host "10.190.1.35" :port 6379}}) ; See `wcar` docstring for opts
+(def server2-conn {:pool {:max-total 8} :spec {:host "10.180.29.35" :port 6379}}) ; See `wcar` docstring for opts
 (defmacro wcar* [& body] `(car/wcar server2-conn ~@body))
 
 (defn round
@@ -97,7 +98,7 @@
   [start end carno_coll]
   (let [params (join " ," (repeat (count carno_coll) "?"))
         sql (join ["select  CARDNO,ENPROVID||'0000' AS ENPROVID, ENPROVID||'|'||ENNETID||'|'||INSTATIONID||'|'||INSTATION AS INSTATION, INTIME,
-                      EXPROVID||'|'||EXNETID||'|'||OUTSTATIONID||'|'||OUTSTATION AS OUTSTATION, OUTTIME from DA_ETC_CONSUME_PARSE where cardno in ("
+                      EXPROVID||'|'||EXNETID||'|'||OUTSTATIONID||'|'||OUTSTATION AS UTSTATION, OUTTIME from DA_ETC_CONSUME_PARSE where cardno in ("
                    params
                    ") and savetime > to_date(?,'YYYY-MM-DD') and savetime < to_date(?,'YYYY-MM-DD')"
                    "and intime is not null and outtime is not null"
@@ -107,7 +108,7 @@
         (->> (j/query (db-conn) (concat [sql] carno_coll, [start end]))
              (group-by :cardno)
              (vals))
-        (catch Exception e (prn e))
+        (catch Exception e (log/error e sql))
         (finally [])))))
 
 (defn drive_intime
@@ -234,6 +235,7 @@
 
 (defn insert-gaode-data
   ([] 0)
+  ([coll] (when-not (empty? coll) (j/insert-multi! (db-conn) :gaode_station coll)))
   ([i coll] (+ i (count (j/insert-multi! (db-conn) :gaode_station coll)))))
 
 (defn insert-baidu-data
@@ -248,12 +250,27 @@
   []
   (->> (wcar* (car/keys "GAODE:*"))
        (partition-all 256)
-       (mapcat (fn [keys] (map (fn [x y] [x y]) keys (wcar* (mapv car/hgetall* keys))))) ;[([k1,v1] [k2,v2],...),...]
+       vec
+       (r/mapcat (fn [keys] (map (fn [x y] [x y]) keys (wcar* (mapv car/hgetall* keys))))) ;[([k1,v1] [k2,v2],...),...]
+       (r/foldcat)
+       vec
+       (r/map #(apply gaode %))
+       (r/filter #(zero? (j/query (db-conn) ["select count(1) as num from GAODE_STATION where lng = ? and lat = ?" (:lng %) (:lat %)] {:row-fn :num :result-set-fn first})))
+       (r/foldcat)
        (partition-all 20)
        vec
-       (r/map (fn [coll] (map #(apply gaode %) coll)))
        (r/fold + insert-gaode-data)))
 
+(defn save-gaode-to-db
+  []
+  (redis-keyscan "GAODE:*" 2000
+                 (fn [keys]
+                   (->> keys
+                        ((fn [keys] (map (fn [x y] [x y]) keys (wcar* :as-pipeline (mapv car/hgetall* keys)))))
+                        (r/map #(apply gaode %))
+                        (r/filter #(zero? (j/query (db-conn) ["select count(1) as num from GAODE_STATION where lng = ? and lat = ?" (:lng %) (:lat %)] {:row-fn :num :result-set-fn first})))
+                        (r/foldcat)
+                        (insert-gaode-data)))))
 (defn- convert-baidu-gaode
   [m]
   (let [{lng :lng lat :lat} m]
@@ -364,8 +381,7 @@
   (with-open [analyzer (SmartChineseAnalyzer. stop-words)
               directory (FSDirectory/open (Paths/get file))
               indexWriter (IndexWriter. directory (IndexWriterConfig. analyzer))]
-    (let [gaode (db-gaode-station)
-          baidu (db-baidu-station)]
+    (let [gaode (db-gaode-station)]
       (doseq [c gaode]
         (.addDocument indexWriter
                       (doto (Document.)
@@ -393,7 +409,7 @@
           results (.search searcher query 10)
           hits (.-scoreDocs results)
           station (transient [])]
-      (prn (.toString query))
+      (log/info (.toString query))
       (doseq [hit hits]
         (let [doc (.doc searcher (.-doc hit))
               score (.-score hit)]
@@ -438,7 +454,7 @@ where intime > to_date(?,'YYYY-MM-DD') and intime < to_date(?,'YYYY-MM-DD') GROU
               spendtime (condition :spendtime)
               in_poi (condition :in_poi [])
               out_poi (condition :out_poi [])]
-          (prn condition)
+          (log/debug condition)
           (->> (for [in in_poi out out_poi] {:in in :out out})
                (map (fn [m] (assoc m :speed (if (zero? spendtime) 0 (/ (distance_pois (mapv (m :in) [:lng :lat]) (mapv (m :out) [:lng :lat])) spendtime)))))
                ;;(filter (fn [m] (< (m :speed) 120.0)))
@@ -449,18 +465,19 @@ where intime > to_date(?,'YYYY-MM-DD') and intime < to_date(?,'YYYY-MM-DD') GROU
 (defn- process-lucene-searchresult
   [searcher station province entry]
   (let [parse (QueryParser. "station" (SmartChineseAnalyzer. stop-words))
-        query (.parse parse (str station "^2 attr:" station " -attr:" entry " +pcode:" province))
+        query (.parse parse (str station "^2 attr:" station " -attr:" entry (when-not (nil? province) (str " +pcode:" province))))
         results (.search searcher query 10)
         hits (.-scoreDocs results)
         station (transient [])]
+    (log/debug (.toString query))
     (doseq [hit hits]
       (let [doc (.doc searcher (.-doc hit))
             score (.-score hit)]
         (conj! station {:score score, :key (.get doc "key") :pcode (.get doc "pcode")})))
     (let [coll (persistent! station)
-          max_score (:score (apply max-key :score coll))]
+          max_score (:score (apply max-key :score (if (empty? coll) [{:score 0}] coll)))]
       (->> coll
-           (r/filter #(<= max_score (% :score)))
+           (r/filter #(= max_score (% :score)))
            (r/map #(merge % (gaode (:key %) {})))
            (r/map #(dissoc % :key))
            (into [])))))
@@ -471,32 +488,41 @@ where intime > to_date(?,'YYYY-MM-DD') and intime < to_date(?,'YYYY-MM-DD') GROU
   (let [index_dir (if (= "Windows_NT" (System/getenv "os")) "file:///D:/lucene-index" "file:////home/etc/lucene-index")
         searcher (station-lucene-searcher (java.net.URI. index_dir))]
     (go (while true
-          (let [condition (<! in-channel)
-                instation (condition :instation)
-                outstation (condition :outstation)
-                province (condition :pcode)
-                in_poi (condition :in_poi [])
-                out_poi (condition :out_poi [])
-                search (memoize process-lucene-searchresult)]
-            (try (>! out-channel (assoc condition :in_poi (if (seq in_poi) in_poi (search searcher instation province "出口"))
-                                        :out_poi (if (seq out_poi) out_poi (search searcher outstation province "入口"))))
-                 (catch Exception e (prn e))))))))
+          (try
+            (let [condition (<! in-channel)
+                  instation (condition :instation)
+                  outstation (condition :outstation)
+                  province (condition :pcode)
+                  in_poi (condition :in_poi [])
+                  out_poi (condition :out_poi [])
+                  search (memoize process-lucene-searchresult)
+                  inpoi (->> in_poi
+                             ((fn [c] (if (seq c) c (search searcher instation province "出口"))))
+                             ((fn [c] (if (> (:score (first c) 21) 20.0) c  (search searcher instation nil "出口")))))
+                  outpoi (->> out_poi
+                              ((fn [c] (if (seq c) c (search searcher outstation province "入口"))))
+                              ((fn [c] (if (> (:score (first c) 21) 20.0) c  (search searcher outstation nil "入口")))))]
+              (>! out-channel (assoc condition :in_poi inpoi
+                                     :out_poi outpoi)))
+            (catch Exception e (log/error e) []))))))
 
 (defn search-gaode-station
-  [in-channel out-channel]
+  [in-channel out-channel final-channel]
   (let []
     (go (while true
-          (let [condition (<! in-channel)
-                instation (condition :instation)
-                outstation (condition :outstation)
-                province (condition :pcode)
-                in_poi (condition :in_poi [])
-                out_poi (condition :out_poi [])
-                search (memoize gaode-station)]
-            (try
-              (>! out-channel (assoc condition :in_poi (if (seq in_poi) in_poi (search instation province "出口"))
-                                     :out_poi (if (seq out_poi) out_poi (search outstation province "入口"))))
-              (catch SQLException se (j/print-sql-exception se))))))))
+          (try
+            (let [condition (<! in-channel)
+                  instation (condition :instation)
+                  outstation (condition :outstation)
+                  province (condition :pcode)
+                  in_poi (condition :in_poi [])
+                  out_poi (condition :out_poi [])
+                  search (memoize gaode-station)
+                  in_result (search instation province "出口")
+                  out_result (search outstation province "入口")]
+              (>! (if (or (empty? in_result) (empty? out_result)) out-channel final-channel)
+                  (assoc condition :in_poi in_result :out_poi out_result)))
+            (catch SQLException se (log/error se) []))))))
 
 (defn search-baidu-station
   [in-channel out-channel]
@@ -510,8 +536,9 @@ where intime > to_date(?,'YYYY-MM-DD') and intime < to_date(?,'YYYY-MM-DD') GROU
                 out_poi (condition :out_poi [])
                 search (memoize baidu-station)]
             (try
-              (>! out-channel (assoc condition :in_poi (if (seq in_poi) in_poi (search instation province))
-                                     :out_poi (if (seq out_poi) out_poi (search outstation province))))
+              (>! out-channel (->> condition
+                                  (#(if (seq in_poi) (assoc % :in_poi (search instation province)) condition))
+                                  (#(if (seq out_poi) (assoc % :out_poi (search outstation province)) condition))))
               (catch SQLException se (j/print-sql-exception se))))))))
 
 (defn process-station
@@ -523,7 +550,7 @@ where intime > to_date(?,'YYYY-MM-DD') and intime < to_date(?,'YYYY-MM-DD') GROU
     (save-station-poi final-chan)
     (search-in-lucene lucene-chan final-chan)
     (search-baidu-station baidu-chan lucene-chan)
-    (search-gaode-station gaode-chan baidu-chan)
+    (search-gaode-station gaode-chan baidu-chan final-chan)
     gaode-chan))
 
 (defn hyv-speed
@@ -565,38 +592,56 @@ where intime > to_date(?,'YYYY-MM-DD') and intime < to_date(?,'YYYY-MM-DD') GROU
            count
            +))))
 
-(defn -main
-  [& args]
+(defn search-station-poi
+  "查询入站出站的可能坐标,并更新到redis"
+  []
   (let [c (process-station)
-        sql "select * from PCODE_INSTATION_OUTSTATION_7"]
+        sql "select pcode,instation,outstation,spendtime from PCODE_INSTATION_OUTSTATION_7 where  ((inscore >0 and inscore < 20) or (outscore >0 and outscore < 20))"]
     (loop [page 1]
       (when-let [coll (seq (oracle-page-query sql page 2000))]
         (doseq [m coll]
           (when true;;(zero? (wcar* (car/exists (join ":" (mapv m [:pcode :instation :outstation])))))
-            (prn (assoc m :spendtime (round (:spendtime m) 3))) (>!! c (assoc m :spendtime (round (:spendtime m) 3)))))
+            (log/debug (assoc m :spendtime (round (:spendtime m) 3))) (>!! c (assoc m :spendtime (round (:spendtime m) 3)))))
         (recur (inc page))))
-    (close! c))
+    (close! c)
+    (Thread/sleep 5000))
   ;; (let [pcode (vals province)]
   ;;   (doseq [p pcode]
   ;;     (redis-keyscan (join ":" [p "*"]) 300 (fn [keys] (wcar* (mapv #(car/del %) keys))))))
 )
 
-;; (defn -main
-;;   "抽取所有路径坐标"
-;;   [& args]
-;;   (with-open [writer (io/writer "poitopoi.txt")]
-;;     (doseq [p (vals province)]
-;;       (redis-keyscan (join ":" [p "*"]) 300
-;;                      (fn [keys]
-;;                        (let [values (wcar* :as-pipeline (mapv #(car/get %) keys))
-;;                              maps (mapcat #(:road %) values)]
-;;                          (doseq [m maps]
-;;                            (prn m)
-;;                            (.write writer (join ":" [(get-in m [:in :lng])
-;;                                                      (get-in m [:in :lat])
-;;                                                      (get-in m [:out :lng])
-;;                                                      (get-in m [:out :lat])
-;;                                                      "\n"])))))))))
+(defn save-station-path
+  "抽取所有路径坐标"
+  [& args]
+  (with-open [writer (io/writer "poitopoi.txt")]
+    (doseq [p (vals province)]
+      (redis-keyscan (join ":" [p "*"]) 5000
+                     (fn [keys]
+                       (let [values (wcar* :as-pipeline (mapv #(car/get %) keys))
+                             dc-keys (->> values
+                                          (r/mapcat #(:road %))
+                                          (r/map #(join ":" ["DC"
+                                                             (get-in % [:in :lng])
+                                                             (get-in % [:in :lat])
+                                                             (get-in % [:out :lng])
+                                                             (get-in % [:out :lat])]))
+                                          (into []))
+                             ext (wcar* :as-pipeline (mapv #(car/exists %) dc-keys))]
+                         (doseq [m (map list dc-keys ext)]
+                           (when (zero? (last m))
+                             (log/debug (first m))
+                             (.write writer (str (first m) "\n"))))))))))
+
+(defn save-poi-of-stations
+  "抽取出入站已确定坐标，用于计算路径"
+  [sql file]
+  (with-open [writer (io/writer file)]
+    (loop [page 1]
+      (when-let [coll (seq (oracle-page-query sql page 2000))]
+        (doseq [m coll]
+          (.write writer (join ":" (conj (map m [:inlng :inlat :outlng :outlat]) "DR")))
+          (.write writer "\n"))
+        (recur (inc page))))))
 
 ;; (defn save-another-redis
 ;;   [& args]
@@ -612,11 +657,56 @@ where intime > to_date(?,'YYYY-MM-DD') and intime < to_date(?,'YYYY-MM-DD') GROU
         road (:road value)]
     (->> road
          (map (fn [m] (join ":" ["DC"
-                                   (get-in m [:in :lng])
-                                   (get-in m [:in :lat])
-                                   (get-in m [:out :lng])
-                                   (get-in m [:out :lat])])))
-         ((fn [keys] (map (fn [x y] (assoc x :distance (Double/valueOf y))) road (wcar* :as-pipeline (mapv #(car/get %) keys)))))
-         ;;(sort-by :distance)
-         ;;(first)
-         )))
+                                 (get-in m [:in :lng])
+                                 (get-in m [:in :lat])
+                                 (get-in m [:out :lng])
+                                 (get-in m [:out :lat])])))
+         ((fn [keys] (map (fn [x y] (assoc x :distance (if (nil? y) 0 (Double/valueOf y)))) road (wcar* :as-pipeline (mapv #(car/get %) keys)))))
+         (sort-by :distance)
+         (first))))
+
+(defn road-path
+  [cardno]
+  (let [coll (j/query (db-conn) ["select ENPROVID||'0000' as pcode,INSTATION,OUTSTATION,intime from DA_ETC_CONSUME_PARSE where cardno = ? and intime > date'2016-07-01' and intime < date'2016-08-01' order by intime" cardno])
+        path-search (memoize min-path)
+        road (map (fn [m] (let [{pcode :pcode instation :instation outstation :outstation intime :intime} m] (path-search pcode instation outstation))) coll)]
+    (with-open [writer (io/writer "road.csv")]
+      (doseq [m road]
+        (.write writer (join "," [(get-in m [:in :station]) (get-in m [:in :lng]) (get-in m [:in :lat]) (get-in m [:out :station]) (get-in m [:out :lng]) (get-in m [:out :lat]) "\n"]))))))
+
+(defn update-min-route
+  "获取出入站所有可能坐标间的最短距离"
+  [& args]
+  (let [sql "select pcode, instation, outstation from PCODE_INSTATION_OUTSTATION_7 where  (inscore >0 and inscore < 20) or (outscore >0 and outscore < 20)"
+        count (oracle-count sql)
+        page-count (inc (quot count 500))]
+    (->> (range page-count)
+         vec
+         (r/mapcat #(oracle-page-query sql % 500))
+         (r/foldcat)
+         (r/map (fn [m] (merge m (min-path (:pcode m) (:instation m) (:outstation m)))))
+         ;;(r/filter #(not (zero? (:distance % -1))))
+         (r/map #(try (j/with-db-connection [db (db-conn)] (first (j/update! db :PCODE_INSTATION_OUTSTATION_7
+                                                                             {:inname (get-in % [:in :station])
+                                                                              :inattr (get-in % [:in :attr])
+                                                                              :inlng (get-in % [:in :lng])
+                                                                              :inlat (get-in % [:in :lat])
+                                                                              :outname (get-in % [:out :station])
+                                                                              :outattr (get-in % [:out :attr])
+                                                                              :outlng (get-in % [:out :lng])
+                                                                              :outlat (get-in % [:out :lat])
+                                                                              :inscore (get-in % [:in :score] 0)
+                                                                              :outscore (get-in % [:out :score] 0)
+                                                                              :distance (:distance %)}
+                                                                             ["pcode=? and instation=? and outstation=?" (:pcode %) (:instation %) (:outstation %)]))) (catch Exception e (log/error e) 0)))
+         (r/fold +))))
+
+(defn get-path-points-from-redis
+ [key]
+ (->> (wcar* (car/parse-raw (car/get key)))
+      (io/input-stream)
+      (java.util.zip.GZIPInputStream.)
+      (slurp)))
+(defn -main
+  [& args]
+  (update-min-route))

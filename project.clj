@@ -16,6 +16,11 @@
                  [org.apache.lucene/lucene-analyzers-smartcn"6.3.0"]
                  [org.apache.lucene/lucene-queryparser "6.3.0"]
                  [org.apache.lucene/lucene-queries"6.3.0"]
+                 [org.clojure/tools.logging "0.3.1"]
+                 [org.slf4j/slf4j-api "1.6.2"]
+                 [org.slf4j/slf4j-log4j12 "1.6.2"]
+                 [log4j "1.2.16"]
+                 [commons-logging "1.1.1"]
                  ]
   :profiles {:dev {:plugins [[cider/cider-nrepl "0.15.0-SNAPSHOT"]]}}
   :local-repo "D:\\m2"
