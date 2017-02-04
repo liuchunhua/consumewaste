@@ -21,6 +21,8 @@
                  [org.slf4j/slf4j-log4j12 "1.6.2"]
                  [log4j "1.2.16"]
                  [commons-logging "1.1.1"]
+                 [org.clojure/data.csv "0.1.3"]
+                 [org.postgresql/postgresql "9.4.1212"]
                  ]
   :profiles {:dev {:plugins [[cider/cider-nrepl "0.15.0-SNAPSHOT"]]}}
   :local-repo "D:\\m2"

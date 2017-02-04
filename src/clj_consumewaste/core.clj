@@ -10,6 +10,7 @@
              :as a
              :refer [>! <! >!! <!! go chan buffer close! thread
                      alts! alts!! timeout]]
+            [clojure.data.csv :as csv]
             [clojure.tools.logging :as log])
   (:import com.mchange.v2.c3p0.ComboPooledDataSource
            java.sql.SQLException
@@ -31,6 +32,16 @@
          :user "sdhsums"
          :password "sdhsums"})
 
+(def pg-db {:classname "org.postgresql.Driver"
+            :subprotocol "postgresql"
+            :subname "//localhost:5432/etc"
+            :dbtype "postgresql"
+            :dbname "etc"
+            :host "localhost"
+            :user "analysis"
+            :password "data"
+            })
+
 (defn db_pool
   [spec]
   (let [cpds (doto (ComboPooledDataSource.)
@@ -44,7 +55,7 @@
                (.setMaxIdleTime (* 3 60 60)))]
     {:datasource cpds}))
 
-(def pooled-db (delay (db_pool db)))
+(def pooled-db (delay (db_pool pg-db)))
 
 (defn db-conn [] @pooled-db)
 
@@ -576,6 +587,12 @@ where intime > to_date(?,'YYYY-MM-DD') and intime < to_date(?,'YYYY-MM-DD') GROU
     (j/with-db-connection [conn (db-conn)]
       (j/query conn (concat [page-sql] args)))))
 
+(defn oracle-page-query-array
+  [sql page pagesize & args]
+  (let [page-sql (str "SELECT * FROM (SELECT A.*, ROWNUM RN FROM (" sql " ) A WHERE ROWNUM < " (* page pagesize) ") WHERE RN >=" (* (dec page) pagesize))]
+    (j/with-db-connection [conn (db-conn)]
+      (j/query conn (concat [page-sql] args) {:as-arrays? true :row-fn drop-last}))))
+
 (defn- freq
   []
   (with-open [rd (io/reader "D:\\freq.txt")]
@@ -710,3 +727,40 @@ where intime > to_date(?,'YYYY-MM-DD') and intime < to_date(?,'YYYY-MM-DD') GROU
 (defn -main
   [& args]
   (update-min-route))
+
+;;(with-open [out-file (io/writer "gaode.csv")] (let [data (j/query (db-conn) ["select g.ID,g.STATION,g.attr,'('||g.lng||','||g.lat||')' AS poi,g.province,g.city,g.ad,g.address,g.pcode,g.citycode,g.adcode,g.tag from gaode_station g"] {:as-arrays? true})] (csv/write-csv out-file data)))
+
+;; (with-open [out-file (io/writer "in_out_station.csv")]
+;;   (let [sql "select p.pcode,p.instation,p.outstation,p.spendtime,p.inname,p.inattr,'('||p.inlng||','||p.inlat||')' as in_poi,
+;; p.outname,p.outattr,'('||p.outlng||','||p.outlat||')' as out_poi,p.distance,p.inscore,p.outscore,p.speed from pcode_instation_outstation_7 p
+;; where p.inlng is not null and p.inlat is not null and p.outlng is not null and p.outlat is not null"
+;;         total (oracle-count sql)
+;;         pagesize 3000]
+;;     (doseq [page (range 1 (+ 2 (quot total pagesize)))]
+;;       (csv/write-csv out-file (rest (oracle-page-query-array sql page pagesize))))))
+
+
+;; (with-open [out-file (io/writer "etc_consumewaste")]
+;;   (let [sql "select a.*,b.userid,c.username from da_etc_consume_parse a
+;; left join card_userid b on a.cardno = b.cardid 
+;; left join etc_t_user c on b.userid = c.userid
+;; where a.intime > date'2016-07-01' and a.intime < date'2016-08-01'"
+;;         total (oracle-count sql)
+;;         pagesize 10000]
+;;     (doseq [page (range 1 (+ 2 (quot total pagesize)))]
+;;       (csv/write-csv out-file (rest (oracle-page-query-array sql page pagesize))))))
+
+
+(defn export-large-date
+  [sql file]
+  (with-open [out (io/writer file)]
+    (let [fetchsize 10000]
+      (j/with-db-transaction [conn (db-conn)]
+        (j/query conn (j/prepare-statement (:connection conn)sql {:fetch-size fetchsize}) {:as-arrays? true :result-set-fn #(csv/write-csv out %)})))))
+
+(defn export-etc-consumewaste-parse
+  [file]
+  (export-large-date "select a.*,b.userid,c.username from da_etc_consume_parse a
+left join card_userid b on a.wasteid = b.wasteid 
+left join etc_t_user c on b.userid = c.userid
+where a.intime > date'2016-07-01' and a.intime < date'2016-08-01'" file))
