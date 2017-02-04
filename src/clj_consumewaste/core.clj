@@ -23,7 +23,8 @@
            (org.apache.lucene.search IndexSearcher Query ScoreDoc TopDocs Sort SortField SortField$Type)
            (org.apache.lucene.queryparser.classic QueryParser)
            (org.apache.lucene.document Document Field TextField StringField Field$Store)
-           (java.nio.file Paths))
+           (java.nio.file Paths)
+           (org.postgresql.geometric PGpoint PGpath))
   (:gen-class))
 
 (def db {:classname "oracle.jdbc.OracleDriver"
@@ -34,7 +35,7 @@
 
 (def pg-db {:classname "org.postgresql.Driver"
             :subprotocol "postgresql"
-            :subname "//localhost:5432/etc"
+            :subname "//10.180.29.35:5432/etc"
             :dbtype "postgresql"
             :dbname "etc"
             :host "localhost"
@@ -764,3 +765,27 @@ where intime > to_date(?,'YYYY-MM-DD') and intime < to_date(?,'YYYY-MM-DD') GROU
 left join card_userid b on a.wasteid = b.wasteid 
 left join etc_t_user c on b.userid = c.userid
 where a.intime > date'2016-07-01' and a.intime < date'2016-08-01'" file))
+
+(defn- parse-redis-dr-key
+  [key]
+  (let [a (split key #":")
+        start (str "(" (a 1) "," (a 2) ")")
+        end (str "(" (a 3) "," (a 4) ")")]
+    {:start_poi (PGpoint. start) :end_poi (PGpoint. end)}))
+(defn- parse-redis-path
+  [v]
+  {:route (try (PGpath. (str "[(" (str/replace v #";" "),(") ")]")) (catch Exception e (log/error v)))})
+
+(defn save-road-path-to-pgsql
+  []
+  (let [not-exists? (fn [key] (zero? (j/query (db-conn) (concat ["select count(1) as num from road_path where start_poi = ? and end_poi = ?" ] (mapv (parse-redis-dr-key key) [:start_poi :end_poi]) {:row-fn :num :result-set-fn first}))))]
+    (redis-keyscan "DR:*" 20000
+                   (fn handle_keys [keys]
+                     (->> keys
+                          vec
+                          (r/filter #(not-exists? %))
+                          (r/map #(hash-map :key % :route (get-path-points-from-redis %)))
+                          (r/map #(merge % (parse-redis-dr-key (:key %)) (parse-redis-path (:route %))))
+                          (r/map #(dissoc % :key))
+                          (r/map #(j/insert! (db-conn) :road_path %))
+                          (r/fold + (fn ([] 0) ([x _] (inc x)))))))))
