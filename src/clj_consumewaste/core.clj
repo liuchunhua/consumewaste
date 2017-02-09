@@ -725,9 +725,7 @@ where intime > to_date(?,'YYYY-MM-DD') and intime < to_date(?,'YYYY-MM-DD') GROU
       (io/input-stream)
       (java.util.zip.GZIPInputStream.)
       (slurp)))
-(defn -main
-  [& args]
-  (update-min-route))
+
 
 ;;(with-open [out-file (io/writer "gaode.csv")] (let [data (j/query (db-conn) ["select g.ID,g.STATION,g.attr,'('||g.lng||','||g.lat||')' AS poi,g.province,g.city,g.ad,g.address,g.pcode,g.citycode,g.adcode,g.tag from gaode_station g"] {:as-arrays? true})] (csv/write-csv out-file data)))
 
@@ -774,18 +772,26 @@ where a.intime > date'2016-07-01' and a.intime < date'2016-08-01'" file))
     {:start_poi (PGpoint. start) :end_poi (PGpoint. end)}))
 (defn- parse-redis-path
   [v]
-  {:route (try (PGpath. (str "[(" (str/replace v #";" "),(") ")]")) (catch Exception e (log/error v)))})
+  {:route (try (PGpath. (str "[(" (str/replace v #";" "),(") ")]")) (catch Exception e (log/error "转换失败！")))})
+
+(defn- handle_keys
+  [keys]
+  (->> keys
+       ((fn [c] (log/info "keys:" (count c)) c))
+       vec
+       ;;(r/filter #(not-exists? %))
+       (r/map #(hash-map :key % :route (try (get-path-points-from-redis %) (catch Exception e (log/error %) nil))))
+       (r/map #(merge % (parse-redis-dr-key (:key %)) (parse-redis-path (:route %))))
+       (r/map #(dissoc % :key))
+       (r/foldcat)
+       ((fn [c] (j/insert-multi! (db-conn) :road_path c) (log/info "insert:" (count c))))
+       ))
 
 (defn save-road-path-to-pgsql
   []
-  (let [not-exists? (fn [key] (zero? (j/query (db-conn) (concat ["select count(1) as num from road_path where start_poi = ? and end_poi = ?" ] (mapv (parse-redis-dr-key key) [:start_poi :end_poi]) {:row-fn :num :result-set-fn first}))))]
-    (redis-keyscan "DR:*" 20000
-                   (fn handle_keys [keys]
-                     (->> keys
-                          vec
-                          (r/filter #(not-exists? %))
-                          (r/map #(hash-map :key % :route (get-path-points-from-redis %)))
-                          (r/map #(merge % (parse-redis-dr-key (:key %)) (parse-redis-path (:route %))))
-                          (r/map #(dissoc % :key))
-                          (r/map #(j/insert! (db-conn) :road_path %))
-                          (r/fold + (fn ([] 0) ([x _] (inc x)))))))))
+  (let [not-exists? (fn [k] (zero? (j/query (db-conn) (concat ["select count(1) as num from road_path where start_poi ~= ? and end_poi ~= ?" ] (mapv (parse-redis-dr-key k) [:start_poi :end_poi])) {:row-fn :num :result-set-fn first})))]
+    (redis-keyscan "DR:*" 2000 handle_keys)))
+
+(defn -main
+  [& args]
+  (save-road-path-to-pgsql))
