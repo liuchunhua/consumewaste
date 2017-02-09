@@ -1,5 +1,6 @@
 (set-env!
  :source-paths #{"src"}
+ :resource-paths #{"resources"}
  :dependencies '[[org.clojure/clojure "1.8.0"]
                  [org.clojure/core.async "0.2.395"]
                  [incanter/incanter-core "1.5.7"]
